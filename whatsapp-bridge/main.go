@@ -12,6 +12,8 @@ import (
 	"math/rand"
 	"mime"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -1981,8 +1983,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 				_, _, _, _, _ = downloadMediaForMessage(client, messageStore, msg.Info.ID, chatJID)
 			}()
 		}
-	} else if mediaType != "" && url != "" && len(mediaKey) > 0 {
+	} else if mediaType != "" && url != "" && len(mediaKey) > 0 && shouldAutoDownload(chatJID) {
 		// Media that is not included in a webhook payload: async download for caching.
+		// status@broadcast is skipped (see media_cache.go) — it filled the volume.
 		logger.Infof("Auto-downloading %s media for message %s", mediaType, msg.Info.ID)
 		go func() {
 			success, _, _, downloadPath, err := downloadMediaForMessage(client, messageStore, msg.Info.ID, chatJID)
@@ -2271,6 +2274,48 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 	}
 	mux := http.NewServeMux()
 
+	// Friendly status page for the pairing URL once a session exists, so
+	// revisiting /pair after linking doesn't look broken (see pairing_ui.go).
+	if pairingUIEnabled() {
+		mux.HandleFunc("/pair", pairingBasicAuth(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			fmt.Fprint(w, `<!doctype html><html><head><meta charset="utf-8"><title>Link WhatsApp</title></head><body style="font-family:-apple-system,sans-serif;background:#111b21;color:#e9edef;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0"><h2>✅ WhatsApp is linked — the bridge is running.</h2></body></html>`)
+		}))
+	}
+
+	// Reverse-proxy /mcp to a colocated MCP server (streamable-http) so a
+	// single public port serves pairing UI, REST API, and MCP. Enabled by
+	// WHATSAPP_MCP_PROXY (e.g. http://127.0.0.1:9090); bearer + Host auth is
+	// enforced here, the inner MCP server stays loopback-only.
+	if target := strings.TrimSpace(os.Getenv("WHATSAPP_MCP_PROXY")); target != "" {
+		if u, perr := url.Parse(target); perr == nil {
+			proxy := httputil.NewSingleHostReverseProxy(u)
+			proxy.FlushInterval = -1 // stream SSE responses immediately
+			// Rewrite Host to the loopback target and drop the public
+			// Origin/Referer so the MCP server's DNS-rebinding guard (which
+			// otherwise 421s an unexpected Host) accepts the proxied request.
+			origDirector := proxy.Director
+			proxy.Director = func(r *http.Request) {
+				origDirector(r)
+				r.Host = u.Host
+				r.Header.Del("Origin")
+				r.Header.Del("Referer")
+			}
+			mcpHandler := auth(func(w http.ResponseWriter, r *http.Request) {
+				// Enforce per-token send scope before forwarding. Only tools/call
+				// for a gated (outbound) tool is inspected; reads pass straight
+				// through. This is the sole point where the *agent's* token is
+				// visible — past here the MCP server uses the admin token.
+				if !enforceMCPSendScope(w, r) {
+					return
+				}
+				proxy.ServeHTTP(w, r)
+			})
+			mux.HandleFunc("/mcp", mcpHandler)
+			mux.HandleFunc("/mcp/", mcpHandler)
+		}
+	}
+
 	// On-demand history sync endpoint (see history_ondemand.go)
 	registerHistoryEndpoint(mux, auth, client, messageStore)
 
@@ -2288,6 +2333,10 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 		}
 		_ = json.NewEncoder(w).Encode(status)
 	}))
+
+	// Admin-only token management: mint/list/revoke scoped tokens that gate
+	// send access per chat. Requires the admin (WHATSAPP_BRIDGE_TOKEN) policy.
+	registerTokenAdmin(mux, auth)
 
 	// Handler for sending messages
 	mux.HandleFunc("/api/send", auth(func(w http.ResponseWriter, r *http.Request) {
@@ -2309,6 +2358,11 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 		// Validate request
 		if req.Recipient == "" {
 			http.Error(w, "Recipient is required", http.StatusBadRequest)
+			return
+		}
+
+		if p := policyFromCtx(r.Context()); p != nil && !p.canSendTo(req.Recipient) {
+			http.Error(w, "Forbidden: this token cannot send to "+req.Recipient, http.StatusForbidden)
 			return
 		}
 
@@ -2372,6 +2426,11 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 		}
 		if req.ChatJID == "" || len(req.MessageIDs) == 0 {
 			http.Error(w, "chat_jid and message_ids are required", http.StatusBadRequest)
+			return
+		}
+
+		if p := policyFromCtx(r.Context()); p != nil && !p.canSendTo(req.ChatJID) {
+			http.Error(w, "Forbidden: this token cannot act on "+req.ChatJID, http.StatusForbidden)
 			return
 		}
 
@@ -2475,7 +2534,13 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 			return
 		}
 		var req ReactRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Recipient == "" || req.MessageID == "" || req.Emoji == nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err == nil && req.Recipient != "" {
+			if p := policyFromCtx(r.Context()); p != nil && !p.canSendTo(req.Recipient) {
+				http.Error(w, "Forbidden: this token cannot react in "+req.Recipient, http.StatusForbidden)
+				return
+			}
+		}
+		if req.Recipient == "" || req.MessageID == "" || req.Emoji == nil {
 			http.Error(w, "recipient, message_id, and emoji are required", http.StatusBadRequest)
 			return
 		}
@@ -2665,16 +2730,23 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int, token string, allowedMediaRoots []string) {
 	handler := newRESTMux(client, messageStore, port, token, allowedMediaRoots)
 
-	// Start the server with proper timeouts. Bind to loopback so the bridge is
-	// not reachable from the LAN; MCP clients talk to it over localhost.
-	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
+	// Start the server with proper timeouts. Binds to loopback by default so
+	// the bridge is not reachable from the LAN; remote deployments behind a
+	// TLS proxy set WHATSAPP_BRIDGE_BIND=0.0.0.0 (see pairing_ui.go).
+	serverAddr := fmt.Sprintf("%s:%d", bridgeBindHost(), port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Create server with timeouts for stability
+	writeTimeout := 60 * time.Second // Longer for media downloads
+	if os.Getenv("WHATSAPP_MCP_PROXY") != "" {
+		// MCP streamable-http keeps long-lived SSE streams open; a write
+		// timeout would sever them.
+		writeTimeout = 0
+	}
 	server := &http.Server{
 		Addr:         serverAddr,
 		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 60 * time.Second, // Longer for media downloads
+		WriteTimeout: writeTimeout,
 		IdleTimeout:  120 * time.Second,
 		Handler:      handler,
 	}
@@ -2714,6 +2786,9 @@ func main() {
 		logger.Errorf("Failed to create store directory: %v", err)
 		return
 	}
+
+	// Keep the inbound media cache from filling the persistent volume.
+	startMediaCacheSweeper("store", logger.Infof)
 
 	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
@@ -2773,6 +2848,25 @@ func main() {
 		logger.Infof("Linked-device name set to %q (WHATSAPP_DEVICE_NAME)", name)
 	}
 
+	// Optional platform icon override (also pair-time only). Without it the
+	// device list shows the session as "Other device"; setting e.g. CHROME
+	// makes it appear as a regular browser session the way WhatsApp Web does.
+	if pt := strings.ToLower(strings.TrimSpace(os.Getenv("WHATSAPP_PLATFORM_TYPE"))); pt != "" {
+		platformTypes := map[string]waCompanionReg.DeviceProps_PlatformType{
+			"chrome":  waCompanionReg.DeviceProps_CHROME,
+			"firefox": waCompanionReg.DeviceProps_FIREFOX,
+			"safari":  waCompanionReg.DeviceProps_SAFARI,
+			"edge":    waCompanionReg.DeviceProps_EDGE,
+			"desktop": waCompanionReg.DeviceProps_DESKTOP,
+		}
+		if v, ok := platformTypes[pt]; ok {
+			store.DeviceProps.PlatformType = v.Enum()
+			logger.Infof("Linked-device platform type set to %q (WHATSAPP_PLATFORM_TYPE)", pt)
+		} else {
+			logger.Warnf("Unknown WHATSAPP_PLATFORM_TYPE=%q, keeping default", pt)
+		}
+	}
+
 	// Create client instance
 	client := whatsmeow.NewClient(deviceStore, logger)
 	if client == nil {
@@ -2826,6 +2920,11 @@ func main() {
 		return
 	}
 	webhookAuthToken = bridgeToken
+
+	// Build the per-token access store (admin token + any scoped tokens from
+	// the env/volume file). Read is open to every valid token; send scope is
+	// enforced at the MCP proxy and REST write handlers (see access.go).
+	initAccessStore(bridgeToken)
 
 	// Print the one-time setup banner immediately, before attempting to
 	// connect/pair. loadOrCreateBridgeToken() already persisted the token to
@@ -2934,7 +3033,24 @@ func main() {
 			logger.Infof("✓ Successfully connected to WhatsApp servers")
 
 		case *events.LoggedOut:
-			logger.Warnf("⚠️  Device logged out, please scan QR code to log in again")
+			// A true logout (device removed from the phone, 14-day-offline
+			// expiry, or a ban) invalidates the Signal session server-side —
+			// no library can revive it; a fresh QR pair is the only path.
+			// Make that self-healing: wipe the dead session so the next boot
+			// starts unpaired, notify via webhook if configured, then exit so
+			// the process supervisor (Railway/systemd/launchd) restarts us
+			// straight into the QR-pairing flow at /pair.
+			logger.Warnf("⚠️  Device logged out (reason: %v) — wiping dead session and restarting to re-pair", v.Reason)
+			notifyLoggedOut(v.Reason, logger)
+			if client.Store != nil {
+				if err := client.Store.Delete(context.Background()); err != nil {
+					logger.Errorf("Failed to wipe logged-out session from store: %v", err)
+				}
+			}
+			client.Disconnect()
+			// Exit non-zero so the supervisor treats it as a restart-worthy
+			// failure and brings us back unpaired.
+			os.Exit(75)
 
 		case *events.Disconnected:
 			logger.Warnf("⚠️  Disconnected from WhatsApp servers, will attempt reconnection...")
@@ -2980,6 +3096,11 @@ func main() {
 		}
 	})
 
+	// While unpaired, expose the browser pairing page (see pairing_ui.go).
+	if client.Store.ID == nil {
+		startPairingUI(fmt.Sprintf("%s:%d", bridgeBindHost(), port))
+	}
+
 	// Create channel to track connection success
 	connected := make(chan bool, 1)
 
@@ -3020,6 +3141,7 @@ func main() {
 			qrCodeShown := false
 			for evt := range qrChan {
 				if evt.Event == "code" {
+					pairingSetCode(evt.Code)
 					if !qrCodeShown {
 						fmt.Println("\nScan this QR code with your WhatsApp app:")
 						qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
@@ -3031,6 +3153,7 @@ func main() {
 					break
 				} else if evt.Event == "timeout" {
 					logger.Warnf("QR code timed out")
+					pairingClearCode()
 					break
 				}
 			}
@@ -3041,12 +3164,14 @@ func main() {
 				fmt.Println("\nSuccessfully connected and authenticated!")
 				goto connectionSuccess
 			case <-ctx.Done():
-				logger.Errorf("Timeout waiting for QR code scan (attempt %d)", attempt)
+				// Unpaired: never give up. Returning here kills the HTTP
+				// listener (pairing UI + /api + /mcp) and the edge serves 502
+				// until someone redeploys. Keep cycling QRs so /pair stays up.
+				logger.Warnf("QR not scanned within 5m — still waiting for pairing at /pair")
+				cancel()
 				client.Disconnect()
-				if attempt == maxRetries {
-					return
-				}
 				time.Sleep(10 * time.Second)
+				attempt--
 				continue
 			}
 		} else {
@@ -3089,6 +3214,7 @@ connectionSuccess:
 	}
 	logger.Infof("Allowed media roots: %v", allowedMediaRoots)
 
+	stopPairingUI()
 	startRESTServer(client, messageStore, port, bridgeToken, allowedMediaRoots)
 
 	// Create a channel to keep the main goroutine alive

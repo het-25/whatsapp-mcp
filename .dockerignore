@@ -1,0 +1,11 @@
+whatsapp-bridge/store/
+whatsapp-bridge/whatsapp-bridge
+**/.venv/
+**/__pycache__/
+**/.git/
+qr/
+logs/
+*.log
+docs/
+example-use.png
+.railway-secrets

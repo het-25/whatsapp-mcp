@@ -3,7 +3,7 @@ import os
 import os.path
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 import requests
@@ -738,6 +738,128 @@ def list_chats(
             conn.close()
 
 
+def _aware(dt: datetime) -> datetime:
+    """Treat naive timestamps as UTC (the bridge stores UTC) so they compare with aware ones."""
+    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+
+
+def list_unread(
+    since: str | None = None,
+    include_groups: bool = True,
+    max_chats: int = 30,
+    max_messages_per_chat: int = 20,
+) -> list[dict[str, Any]]:
+    """Unread chats, each with the inbound messages that arrived after its read marker.
+
+    Read-only: nothing is marked read here, so the phone's unread badges are
+    untouched. A chat counts as unread exactly when `Chat.unread` says so; for
+    chats WhatsApp never reported a read for, every inbound message is a
+    candidate, so pass `since` to bound how far back those go.
+
+    Returns:
+        Chats (most recent first) with jid, name, is_group, last_read_time,
+        unread_count, truncated and `messages` (oldest first, reactions skipped).
+    """
+    since_dt = None
+    if since:
+        try:
+            since_dt = datetime.fromisoformat(since)
+        except ValueError:
+            raise ValueError(f"Invalid date format for 'since': {since}. Please use ISO-8601 format.")
+        since_dt = _aware(since_dt)
+
+    # Scan the most recently active chats; per-chat rows are capped too so a
+    # muted group with thousands of unread messages can't blow up the reply.
+    scan_rows = 200
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            SELECT chats.jid, chats.name, chats.last_message_time,
+                   messages.is_from_me, {_last_read_time_select(cursor, "chats")}
+            FROM chats
+            {_last_message_join("chats", "messages")}
+            WHERE chats.jid != 'status@broadcast'
+            ORDER BY chats.last_message_time DESC
+            LIMIT 500
+            """
+        )
+        candidates = []
+        for jid, name, last_message_time, last_is_from_me, last_read_time in cursor.fetchall():
+            chat = Chat(
+                jid=jid,
+                name=name,
+                last_message_time=datetime.fromisoformat(last_message_time) if last_message_time else None,
+                last_is_from_me=last_is_from_me,
+                last_read_time=datetime.fromisoformat(last_read_time) if last_read_time else None,
+            )
+            if not chat.unread or (chat.is_group and not include_groups):
+                continue
+            if since_dt and _aware(chat.last_message_time) < since_dt:
+                continue
+            candidates.append(chat)
+            if len(candidates) >= max_chats:
+                break
+
+        result = []
+        for chat in candidates:
+            cursor.execute(
+                """
+                SELECT timestamp, sender, content, id, media_type, filename
+                FROM messages
+                WHERE chat_jid = ? AND is_from_me = 0
+                  AND (media_type IS NULL OR media_type != 'reaction')
+                ORDER BY timestamp DESC
+                LIMIT ?
+                """,
+                (chat.jid, scan_rows),
+            )
+            unread_msgs = []
+            for timestamp, sender, content, msg_id, media_type, filename in cursor.fetchall():
+                ts = datetime.fromisoformat(timestamp)
+                if chat.last_read_time and _aware(ts) <= _aware(chat.last_read_time):
+                    break
+                if since_dt and _aware(ts) < since_dt:
+                    break
+                unread_msgs.append(
+                    Message(
+                        timestamp=ts,
+                        sender=sender,
+                        content=content,
+                        is_from_me=False,
+                        chat_jid=chat.jid,
+                        id=msg_id,
+                        chat_name=chat.name,
+                        media_type=media_type,
+                        filename=filename,
+                    )
+                )
+            if not unread_msgs:
+                continue
+            shown = list(reversed(unread_msgs[:max_messages_per_chat]))
+            result.append(
+                {
+                    "jid": chat.jid,
+                    "name": chat.name,
+                    "is_group": chat.is_group,
+                    "last_read_time": chat.last_read_time.isoformat() if chat.last_read_time else None,
+                    "unread_count": len(unread_msgs),
+                    # unread_count is a floor once the per-chat scan cap is hit.
+                    "truncated": len(unread_msgs) > max_messages_per_chat or len(unread_msgs) >= scan_rows,
+                    "messages": [msg_to_dict(m) for m in shown],
+                }
+            )
+        return result
+
+    except sqlite3.Error as e:
+        print(f"Database error: {e}")
+        return []
+    finally:
+        if "conn" in locals():
+            conn.close()
+
+
 def search_contacts(query: str) -> list[dict[str, Any]]:
     """Search contacts by name or phone number.
 
@@ -1255,15 +1377,11 @@ def mark_messages_read(
         return False, f"Unexpected error: {str(e)}"
 
 
-def download_media(message_id: str, chat_jid: str) -> str | None:
-    """Download media from a message and return the local file path.
-
-    Args:
-        message_id: The ID of the message containing the media
-        chat_jid: The JID of the chat containing the message
+def download_media_with_error(message_id: str, chat_jid: str) -> tuple[str | None, str]:
+    """Ask the bridge to download a message's media.
 
     Returns:
-        The local file path if download was successful, None otherwise
+        (path, "") on success, (None, error message) on failure.
     """
     try:
         url = f"{WHATSAPP_API_BASE_URL}/download"
@@ -1276,20 +1394,61 @@ def download_media(message_id: str, chat_jid: str) -> str | None:
             if result.get("success", False):
                 path = result.get("path")
                 print(f"Media downloaded successfully: {path}")
-                return path
-            else:
-                print(f"Download failed: {result.get('message', 'Unknown error')}")
-                return None
-        else:
-            print(f"Error: HTTP {response.status_code} - {response.text}")
-            return None
+                return path, ""
+            msg = result.get("message", "Unknown error")
+            print(f"Download failed: {msg}")
+            return None, msg
+        try:
+            msg = response.json().get("message") or response.text
+        except Exception:
+            msg = response.text
+        print(f"Error: HTTP {response.status_code} - {response.text}")
+        return None, f"HTTP {response.status_code}: {msg}"
 
     except requests.RequestException as e:
         print(f"Request error: {str(e)}")
-        return None
+        return None, f"Request error: {e}"
     except json.JSONDecodeError:
         print(f"Error parsing response: {response.text}")
-        return None
+        return None, "Error parsing bridge response"
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
-        return None
+        return None, f"Unexpected error: {e}"
+
+
+def download_media(message_id: str, chat_jid: str) -> str | None:
+    """Download media from a message and return the local file path.
+
+    Args:
+        message_id: The ID of the message containing the media
+        chat_jid: The JID of the chat containing the message
+
+    Returns:
+        The local file path if download was successful, None otherwise
+    """
+    path, _ = download_media_with_error(message_id, chat_jid)
+    return path
+
+
+def get_media_message_info(message_id: str, chat_jid: str) -> tuple[str | None, str | None]:
+    """Return (media_type, original filename) for a message from messages.db."""
+    conn = None
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        row = conn.execute(
+            "SELECT media_type, filename FROM messages WHERE id = ? AND chat_jid = ?",
+            (message_id, chat_jid),
+        ).fetchone()
+        if not row:
+            return None, None
+        return row[0] or None, row[1] or None
+    except sqlite3.Error:
+        return None, None
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def media_store_root() -> str:
+    """Directory the bridge stores per-chat media under (next to messages.db)."""
+    return os.path.dirname(os.path.abspath(MESSAGES_DB_PATH))

@@ -4,11 +4,16 @@ import sys
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import CallToolResult, TextContent
 
 from mcp_config import resolve_host, resolve_port, resolve_transport
+from media_content import DEFAULT_MAX_BYTES, build_media_content, resolve_media_path
 from parent_watchdog import install_stdio_parent_watchdog
 from whatsapp import (
     download_media as whatsapp_download_media,
+)
+from whatsapp import (
+    download_media_with_error as whatsapp_download_media_with_error,
 )
 from whatsapp import (
     get_chat as whatsapp_get_chat,
@@ -23,6 +28,9 @@ from whatsapp import (
     get_last_interaction as whatsapp_get_last_interaction,
 )
 from whatsapp import (
+    get_media_message_info as whatsapp_get_media_message_info,
+)
+from whatsapp import (
     get_message_context as whatsapp_get_message_context,
 )
 from whatsapp import (
@@ -35,7 +43,13 @@ from whatsapp import (
     list_messages as whatsapp_list_messages,
 )
 from whatsapp import (
+    list_unread as whatsapp_list_unread,
+)
+from whatsapp import (
     mark_messages_read as whatsapp_mark_messages_read,
+)
+from whatsapp import (
+    media_store_root as whatsapp_media_store_root,
 )
 from whatsapp import (
     msg_to_dict,
@@ -245,6 +259,55 @@ def list_chats(
 
 
 @mcp.tool()
+def list_unread(
+    since: str | None = None,
+    include_groups: bool = True,
+    max_chats: int = 30,
+    max_messages_per_chat: int = 20,
+) -> list[dict[str, Any]]:
+    """List unread WhatsApp chats with the unread messages in each — for an inbox digest.
+
+    Read-only: this does NOT mark anything as read, so unread badges on the phone stay
+    as they are. Unread follows the phone's read state (a chat opened on any device
+    drops out).
+
+    Args:
+        since: Optional ISO-8601 date; ignore messages older than this (e.g. last 24h).
+            Recommended for digests — chats WhatsApp never reported a read for would
+            otherwise surface all their inbound history.
+        include_groups: Include group chats (default True)
+        max_chats: Max chats to return, most recent first (default 30, max 100)
+        max_messages_per_chat: Max unread messages shown per chat (default 20, max 100)
+
+    Returns:
+        Chats with jid, name, is_group, last_read_time, unread_count, truncated and
+        messages (oldest first, each with sender_display).
+    """
+    return whatsapp_list_unread(
+        since=since,
+        include_groups=include_groups,
+        max_chats=min(max_chats, 100),
+        max_messages_per_chat=min(max_messages_per_chat, 100),
+    )
+
+
+@mcp.prompt()
+def unread_digest(hours: int = 24) -> str:
+    """Summarise unread WhatsApp messages into an actionable digest."""
+    return (
+        f"Call list_unread with since set to {hours} hours ago (ISO-8601). Do not mark "
+        "anything as read and do not send any messages.\n"
+        "Write a short digest:\n"
+        "1. Needs a reply from me: who, what they asked, how long they've waited, and a "
+        "one-line suggested reply.\n"
+        "2. FYI: worth knowing, no action needed (one line each).\n"
+        "3. Noise: count of chats skipped (promos, big groups with nothing for me).\n"
+        "Put direct messages before groups. In groups, only surface messages that mention "
+        "me or ask something I'd need to answer. Include each chat's name."
+    )
+
+
+@mcp.tool()
 def get_chat(chat_jid: str, include_last_message: bool = True) -> dict[str, Any]:
     """Get WhatsApp chat metadata by JID.
 
@@ -449,6 +512,9 @@ def send_audio_message(recipient: str, media_path: str) -> dict[str, Any]:
 def download_media(message_id: str, chat_jid: str) -> dict[str, Any]:
     """Download media from a WhatsApp message and get the local file path.
 
+    The path is on the bridge host. Remote MCP clients that can't read that
+    filesystem should use get_media_content to receive the file's contents.
+
     Args:
         message_id: The ID of the message containing the media
         chat_jid: The JID of the chat containing the message
@@ -462,6 +528,43 @@ def download_media(message_id: str, chat_jid: str) -> dict[str, Any]:
         return {"success": True, "message": "Media downloaded successfully", "file_path": file_path}
     else:
         return {"success": False, "message": "Failed to download media"}
+
+
+@mcp.tool()
+def get_media_content(message_id: str, chat_jid: str, max_bytes: int = DEFAULT_MAX_BYTES) -> CallToolResult:
+    """Download a WhatsApp media message and return its CONTENTS (not just a path).
+
+    Use this instead of download_media when you need to read/see the file remotely.
+    - Text-like documents (txt, csv, json, md, code, or anything that decodes as UTF-8):
+      returned inline as text, prefixed with filename/mimetype/size. Truncated to
+      max_bytes with a note when larger.
+    - Images (jpeg/png/gif/webp, incl. stickers): returned as an image you can view.
+    - PDFs, audio, video and other binaries: returned as a base64 embedded resource
+      with filename + mimetype.
+    Binaries larger than max_bytes are not returned (metadata + error only).
+
+    Args:
+        message_id: The ID of the message containing the media
+        chat_jid: The JID of the chat containing the message
+        max_bytes: Max bytes of file content to return (default 5242880 = 5 MiB,
+                   hard cap 10485760 = 10 MiB)
+    """
+
+    def _err(msg: str) -> CallToolResult:
+        return CallToolResult(content=[TextContent(type="text", text=msg)], isError=True)
+
+    path, error = whatsapp_download_media_with_error(message_id, chat_jid)
+    if not path:
+        return _err(f"Failed to download media: {error or 'unknown error'}")
+    try:
+        real_path = resolve_media_path(path, whatsapp_media_store_root(), chat_jid)
+    except (ValueError, OSError) as exc:
+        return _err(f"Refusing to read media file: {exc}")
+    media_type, original_name = whatsapp_get_media_message_info(message_id, chat_jid)
+    try:
+        return build_media_content(real_path, original_name=original_name, media_type=media_type, max_bytes=max_bytes)
+    except OSError as exc:
+        return _err(f"Failed to read media file: {exc}")
 
 
 def shutdown_handler(signum, frame):

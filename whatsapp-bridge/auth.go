@@ -120,13 +120,33 @@ func withAuth(token string, allowedHosts map[string]struct{}, h http.HandlerFunc
 			http.Error(w, "Forbidden: host not allowed", http.StatusForbidden)
 			return
 		}
-		if !checkBearerToken(r.Header.Get("Authorization"), token) {
+		// Resolve the presented bearer to a policy. The access store always
+		// contains at least the admin token (== token), so this both
+		// authenticates and attaches the caller's send scope for downstream
+		// enforcement. Falls back to a plain compare if the store is unset.
+		presented := bearerValue(r.Header.Get("Authorization"))
+		var policy *TokenPolicy
+		if access != nil {
+			policy = access.policyFor(presented)
+		} else if checkBearerToken(r.Header.Get("Authorization"), token) {
+			policy = &TokenPolicy{Token: token, Label: "admin", Admin: true, Send: sendAll}
+		}
+		if policy == nil {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="whatsapp-bridge"`)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
-		h(w, r)
+		h(w, r.WithContext(withPolicy(r.Context(), policy)))
 	}
+}
+
+// bearerValue extracts the raw token from an Authorization header, or "".
+func bearerValue(authHeader string) string {
+	const prefix = "Bearer "
+	if !strings.HasPrefix(authHeader, prefix) {
+		return ""
+	}
+	return strings.TrimSpace(authHeader[len(prefix):])
 }
 
 // hostAllowed performs an exact, case-insensitive match against the
@@ -159,9 +179,18 @@ func checkBearerToken(authHeader, expected string) bool {
 // MCP server's choice of WHATSAPP_API_URL determines which Host header the
 // underlying HTTP client emits.
 func buildAllowedHosts(port int) map[string]struct{} {
-	return map[string]struct{}{
+	hosts := map[string]struct{}{
 		fmt.Sprintf("127.0.0.1:%d", port): {},
 		fmt.Sprintf("localhost:%d", port): {},
 		fmt.Sprintf("[::1]:%d", port):     {},
 	}
+	// Remote deployments sit behind a TLS proxy whose public domain arrives
+	// in the Host header (without a port on 443). Allow extra values via a
+	// comma-separated WHATSAPP_BRIDGE_ALLOWED_HOSTS.
+	for _, h := range strings.Split(os.Getenv("WHATSAPP_BRIDGE_ALLOWED_HOSTS"), ",") {
+		if h = strings.TrimSpace(h); h != "" {
+			hosts[h] = struct{}{}
+		}
+	}
+	return hosts
 }

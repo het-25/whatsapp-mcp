@@ -9,6 +9,53 @@ A Model Context Protocol (MCP) server for WhatsApp, enabling Claude to read and 
 
 > Originally created by [Luke Harries](https://github.com/lharries/whatsapp-mcp). Maintained by [Very Good Plugins](https://verygoodplugins.com/?utm_source=github).
 
+## This fork: hosted on Railway, with an unread digest
+
+This fork runs the bridge and the MCP server together in **one container on Railway**. Claude Code (or any MCP client) connects over HTTP, so it works from any machine, and your laptop doesn't need to stay on.
+
+### Deploy (one command)
+
+```bash
+git clone <this repo> && cd whatsapp-mcp
+./deploy-railway.sh            # needs the Railway CLI: brew install railway
+```
+
+The script creates a Railway project with a persistent volume, a public domain and random secrets, then deploys. It prints two things:
+
+1. **A pairing link** (`https://<app>.up.railway.app/pair?key=…`). Open it and scan the QR from WhatsApp → *Settings → Linked devices → Link a device*.
+2. **A `claude mcp add` line.** Run it to connect Claude Code.
+
+Secrets go in `.railway-secrets` (gitignored). Redeploy after a `git pull` with `railway up -y -d`. Budget about $5/month (Hobby plan); the volume starts small and can be resized live.
+
+### Check unread messages without losing your unread state
+
+- `list_unread` returns unread chats with only the messages after your read point. It follows the phone's read state, so a chat you opened anywhere drops out. **It never marks anything read**, so your unread badges stay as they are.
+- `unread_digest` is an MCP prompt that sorts unread messages into *needs a reply* (with a suggested reply), *FYI* and *noise*. In Claude Code, run `/mcp__whatsapp__unread_digest`.
+- **To get the digest on a schedule:**
+  - While a session is open: `/loop 3h /mcp__whatsapp__unread_digest`
+  - From cron or launchd, even with no session open: `claude -p "/mcp__whatsapp__unread_digest" > ~/wa-digest.md`
+  - As a cloud routine: `/schedule`. The MCP server is remote over HTTP, so this works with your laptop closed.
+
+### Tokens and access
+
+Every token can **read all chats**. Sending can be limited per token:
+
+```bash
+./wa-grant.sh grant laptop none                 # read-only
+./wa-grant.sh grant bot 919876543210,<group>@g.us   # may only send to these chats
+./wa-grant.sh list
+./wa-grant.sh revoke <label>
+```
+
+Unlisted sends fail with `send access denied for this token`. The admin token from deploy can send anywhere and manage tokens, so keep it to yourself.
+
+### Other changes from upstream
+
+- **Self-healing.** Restarts and dropped connections recover on their own. If WhatsApp logs the device out, the bridge wipes the dead session and serves a fresh QR at `/pair`. To force a re-pair, set `WHATSAPP_RESET_SESSION=1` for one boot, then **remove it**, or every restart will wipe the session again. For a logout alert, set `LOGOUT_NOTIFY_URL` (any JSON webhook, or a FormSubmit endpoint plus `LOGOUT_NOTIFY_ORIGIN`).
+- **Bounded media cache.** WhatsApp Status posts are never auto-downloaded. Other cached media is swept hourly: kept 48h and capped at 150MB (`MEDIA_CACHE_TTL_HOURS`, `MEDIA_CACHE_MAX_MB`). Without this, a 500MB volume fills up in about a day, and new messages are then silently dropped.
+- **`get_media_content`** returns a media file's contents over MCP (text inline, images viewable, other files as base64), so remote clients can read attachments.
+- **How it's linked.** The bridge appears as "Google Chrome / Mac OS" in Linked devices (`WHATSAPP_PLATFORM_TYPE`, `WHATSAPP_DEVICE_NAME`). This only changes the label; ban risk depends on behaviour, so don't bulk-send.
+
 <p align="center">
   <a href="https://github.com/user-attachments/assets/9475af1d-2369-4315-9ccc-823dba2c5c32"><strong>Watch the WhatsApp MCP demo video</strong></a>
 </p>
