@@ -63,10 +63,10 @@ func TestExtractStringArg(t *testing.T) {
 
 func TestNormalizeTarget(t *testing.T) {
 	cases := map[string]string{
-		"919876543210":                    "919876543210",
-		"919876543210@s.whatsapp.net":     "919876543210",
-		"+91 98765 43210":                 "919876543210",
-		"120363000000000001@g.us":         "120363000000000001@g.us",
+		"919876543210":                "919876543210",
+		"919876543210@s.whatsapp.net": "919876543210",
+		"+91 98765 43210":             "919876543210",
+		"120363000000000001@g.us":     "120363000000000001@g.us",
 	}
 	for in, want := range cases {
 		if got := normalizeTarget(in); got != want {

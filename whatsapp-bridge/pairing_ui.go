@@ -158,7 +158,7 @@ func startPairingUI(addr string) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/pair", pairingBasicAuth(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		fmt.Fprint(w, pairPageHTML)
+		_, _ = fmt.Fprint(w, pairPageHTML)
 	}))
 	mux.HandleFunc("/pair/qr.png", pairingBasicAuth(func(w http.ResponseWriter, r *http.Request) {
 		pairingUI.mu.Lock()
@@ -175,7 +175,7 @@ func startPairingUI(addr string) {
 		}
 		w.Header().Set("Content-Type", "image/png")
 		w.Header().Set("Cache-Control", "no-store")
-		w.Write(img.PNG())
+		_, _ = w.Write(img.PNG())
 	}))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/pair", http.StatusFound)

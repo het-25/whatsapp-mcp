@@ -2279,7 +2279,7 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 	if pairingUIEnabled() {
 		mux.HandleFunc("/pair", pairingBasicAuth(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			fmt.Fprint(w, `<!doctype html><html><head><meta charset="utf-8"><title>Link WhatsApp</title></head><body style="font-family:-apple-system,sans-serif;background:#111b21;color:#e9edef;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0"><h2>✅ WhatsApp is linked — the bridge is running.</h2></body></html>`)
+			_, _ = fmt.Fprint(w, `<!doctype html><html><head><meta charset="utf-8"><title>Link WhatsApp</title></head><body style="font-family:-apple-system,sans-serif;background:#111b21;color:#e9edef;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0"><h2>✅ WhatsApp is linked — the bridge is running.</h2></body></html>`)
 		}))
 	}
 

@@ -44,7 +44,9 @@ func TestSweepMediaCacheTTLAndCap(t *testing.T) {
 	if err := os.WriteFile(db, make([]byte, 5), 0644); err != nil {
 		t.Fatal(err)
 	}
-	os.Chtimes(db, now.Add(-200*time.Hour), now.Add(-200*time.Hour))
+	if err := os.Chtimes(db, now.Add(-200*time.Hour), now.Add(-200*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
 
 	removed, freed, err := sweepMediaCache(store, 48*time.Hour, 150, now)
 	if err != nil {
